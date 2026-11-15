@@ -10,6 +10,8 @@ import 'package:open_wearables_health_sdk/open_wearables_health_sdk.dart';
 import 'package:sentry_flutter/sentry_flutter.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import 'jhe_connect.dart';
+
 // Open Wearables design tokens
 class OWColors {
   static const background = Color(0xFF09090B); // zinc-950
@@ -85,7 +87,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Open Wearables',
+      title: "OLT's Open Wearables",
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,
@@ -123,6 +125,9 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final _hostController = TextEditingController();
   final _invitationCodeController = TextEditingController();
+
+  // true = JHE invitation link, false = Open Wearables server + OW invitation code
+  bool _useJhe = true;
 
   bool _isLoading = false;
   String _statusMessage = '';
@@ -292,7 +297,7 @@ class _HomePageState extends State<HomePage> {
       if (Platform.isAndroid) {
         await _loadAvailableProviders();
         await OpenWearablesHealthSdk.setSyncNotification(
-          title: '🏃 Open Wearables',
+          title: "🏃 OLT's Open Wearables",
           text: '⚡ Sync in progress — keeping your health data fresh 💪',
         );
       }
@@ -310,7 +315,7 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _availableProviders = providers;
         if (_selectedProviderId == null && providers.isNotEmpty) {
-          _selectedProviderId = providers.first.id;
+          _selectedProviderId = providers.firstWhere((p) => p.id != 'samsung', orElse: () => providers.first).id;
         }
       });
     } catch (e) {
@@ -342,9 +347,55 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// Connect using a JHE invitation link or code (OrbitLink flow).
+  Future<void> _connectViaJhe(JheInvite invite) async {
+    setState(() => _isLoading = true);
+    try {
+      final conn = await connectViaJhe(invite, onStatus: _setStatus);
+
+      // Point the SDK at the Open Wearables server JHE talked to.
+      await OpenWearablesHealthSdk.configure(host: conn.owApiUrl);
+      if (Platform.isAndroid && _selectedProviderId != null) {
+        final provider = AndroidHealthProvider.fromId(_selectedProviderId!);
+        if (provider != null) {
+          await OpenWearablesHealthSdk.setProvider(provider);
+        }
+      }
+      _checkStatus();
+
+      _setStatus('Signing in...');
+      final bearerToken = conn.accessToken.startsWith('Bearer ') ? conn.accessToken : 'Bearer ${conn.accessToken}';
+      await OpenWearablesHealthSdk.signIn(
+        userId: conn.owUserId,
+        accessToken: bearerToken,
+        refreshToken: conn.refreshToken,
+      );
+      _setStatus('Connected successfully');
+      _checkStatus();
+
+      if (Platform.isAndroid) {
+        await _loadAvailableProviders();
+      }
+    } catch (e) {
+      _setStatus('Connection failed: $e');
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
   Future<void> _connectWithInvitationCode() async {
     final host = _hostController.text.trim();
     final invitationCode = _invitationCodeController.text.trim();
+
+    if (_useJhe) {
+      final jheInvite = parseJheInvitation(invitationCode);
+      if (jheInvite == null) {
+        _setStatus('Error: paste the full JHE invitation link');
+        return;
+      }
+      await _connectViaJhe(jheInvite);
+      return;
+    }
 
     if (host.isEmpty || invitationCode.isEmpty) {
       _setStatus('Please fill Host and Invitation Code');
@@ -543,7 +594,7 @@ class _HomePageState extends State<HomePage> {
             backgroundColor: OWColors.background,
             flexibleSpace: FlexibleSpaceBar(
               title: const Text(
-                'Open Wearables',
+                "OLT's Open Wearables",
                 style: TextStyle(color: OWColors.textPrimary, fontSize: 20, fontWeight: FontWeight.w600),
               ),
               titlePadding: const EdgeInsets.only(left: 20, bottom: 16),
@@ -735,16 +786,20 @@ class _HomePageState extends State<HomePage> {
               ),
             ),
           ),
-          _buildTextField(
-            controller: _hostController,
-            placeholder: 'Host (e.g. https://api.example.com)',
-            icon: CupertinoIcons.globe,
-            keyboardType: TextInputType.url,
-          ),
+          _buildModeSelector(),
           _buildDivider(),
+          if (!_useJhe) ...[
+            _buildTextField(
+              controller: _hostController,
+              placeholder: 'Open Wearables server (https://...)',
+              icon: CupertinoIcons.globe,
+              keyboardType: TextInputType.url,
+            ),
+            _buildDivider(),
+          ],
           _buildTextField(
             controller: _invitationCodeController,
-            placeholder: 'Invitation Code',
+            placeholder: _useJhe ? 'Paste JHE invitation link' : 'Open Wearables invitation code',
             icon: CupertinoIcons.ticket,
           ),
           Padding(
@@ -768,6 +823,38 @@ class _HomePageState extends State<HomePage> {
                         child: CircularProgressIndicator(strokeWidth: 2, color: OWColors.buttonText),
                       )
                     : const Text('Connect', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildModeSelector() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 4),
+      child: Row(
+        children: [
+          const Icon(CupertinoIcons.link, color: OWColors.textMuted, size: 24),
+          const SizedBox(width: 12),
+          Expanded(
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<bool>(
+                value: _useJhe,
+                isExpanded: true,
+                dropdownColor: OWColors.surfaceLight,
+                iconEnabledColor: OWColors.textMuted,
+                style: const TextStyle(fontSize: 17, color: OWColors.textPrimary),
+                items: const [
+                  DropdownMenuItem<bool>(value: true, child: Text('Connect with JHE invitation link')),
+                  DropdownMenuItem<bool>(value: false, child: Text('Connect to Open Wearables server')),
+                ],
+                onChanged: _isLoading
+                    ? null
+                    : (value) {
+                        if (value != null) setState(() => _useJhe = value);
+                      },
               ),
             ),
           ),
